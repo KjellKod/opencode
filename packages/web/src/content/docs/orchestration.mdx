@@ -33,16 +33,9 @@ See [Agents](/docs/agents), [Commands](/docs/commands), and [Server](/docs/serve
 
 This is the easiest way to orchestrate without writing your own runtime.
 
-### Model selection
-
-Each agent slot can use a different model via the `model` field. This is one of the strongest advantages of config-based orchestration — you can assign models based on role requirements:
-
-- **Orchestrator:** Needs strong instruction-following and gate compliance. Not all models reliably pause for human checkpoints or dispatch subagents correctly. Test orchestrator candidates with your actual workflow before trusting them.
-- **Planning/review roles:** Benefit from reasoning depth and structured output. Often a good fit for models that are fast and analytical.
-- **Implementation roles (builder/fixer):** Benefit from strong code generation. Models with coding-specific training tend to outperform general-purpose models here.
-- **High-judgment roles (arbiter/synthesis):** Benefit from the most capable model you can afford — these roles resolve conflicting inputs and make final calls.
-
-Using different model families across roles also produces genuine diversity of perspective — for example, two reviewers from different families will catch different issues rather than rubber-stamping each other.
+:::tip[Model selection]
+Each agent slot can use a different model via the `model` field. Assign models based on role needs: orchestrators need strong instruction-following, builders benefit from coding-focused models, and high-judgment roles (arbiter/synthesis) benefit from the most capable model available. Using different model families across reviewer roles produces genuine diversity — reviewers from different families catch different issues rather than rubber-stamping each other. Test orchestrator candidates with your actual workflow before trusting them in production.
+:::
 
 ### 1) Define an orchestrator and workers
 
@@ -248,32 +241,26 @@ If your runtime path does not execute branch calls concurrently in practice, thi
 Use a status-gated loop with a hard limit.
 
 A practical pattern:
-1. reviewer returns `APPROVE` or `ITERATE` with concrete issues
+1. reviewer returns `pass` or `fail` with concrete issues
 2. implementer addresses issues
 3. reviewer re-checks
-4. stop on `APPROVE` or `max_iterations`
+4. stop on `pass` or `max_iterations`
 
 Example contract for deterministic routing:
 
 ```json title="review-output.json"
 {
-  "decision": "APPROVE | ITERATE",
+  "decision": "pass | fail",
   "issues": [
-    {
-      "severity": "high | medium | low",
-      "path": "relative/file/path",
-      "summary": "what is wrong",
-      "required_action": "what must change"
-    }
-  ],
-  "next_action": "review | implement | stop"
+    { "file": "relative/path", "description": "what needs to change" }
+  ]
 }
 ```
 
 Guardrails:
 - set explicit `max_iterations` in your orchestration logic
 - set `steps` on orchestrator and workers for cost control
-- make worker outputs structured enough for deterministic routing (for example a required `decision` field)
+- make worker outputs structured enough for deterministic routing (a required `decision` field is the minimum)
 
 ---
 
@@ -281,87 +268,10 @@ Guardrails:
 
 Use this when you need custom control flow, external systems, or language-specific tooling.
 
-:::note
-The examples below are derived from OpenCode's source and API surface. Path A (config + markdown) has been extensively field-tested; Path B has not yet been validated end-to-end. If you encounter issues, please report them.
-:::
+The agents and commands you define in config are available through the same session and command APIs. A code-based driver can create a session, trigger an orchestration command, and poll or stream results — while the agent workflow itself still runs inside OpenCode.
 
-### JS/TS SDK example
-
-```ts
-import { createOpencode } from "@opencode-ai/sdk"
-
-const { client } = await createOpencode()
-
-// Create a parent session
-const session = await client.session.create({
-  body: { title: "Orchestration run" },
-})
-
-// Trigger orchestration command (defined in .opencode/commands/orchestrate.md)
-const result = await client.session.command({
-  path: { id: session.id },
-  body: {
-    command: "orchestrate",
-    arguments: "Refactor auth middleware and add coverage",
-  },
-})
-
-console.log(result.data.info.id)
-```
-
-See [SDK](/docs/sdk).
-
-### Python HTTP example
-
-If your server is protected with `OPENCODE_SERVER_PASSWORD`, use HTTP basic auth (`opencode` as username by default).
-
-```python
-import requests
-
-BASE = "http://127.0.0.1:4096"
-AUTH = ("opencode", "your-server-password")  # optional
-
-# 1) Create parent session
-session = requests.post(
-    f"{BASE}/session",
-    json={"title": "Python orchestration run"},
-    auth=AUTH,  # remove if auth is disabled
-)
-session.raise_for_status()
-sid = session.json()["id"]
-
-# 2) Execute orchestration command
-resp = requests.post(
-    f"{BASE}/session/{sid}/command",
-    json={
-        "command": "orchestrate",
-        "arguments": "Add request IDs across API handlers and tests",
-    },
-    auth=AUTH,  # remove if auth is disabled
-)
-resp.raise_for_status()
-print(resp.json())
-```
-
-See [Server](/docs/server).
-
-### Bash HTTP example
-
-If your server is protected, add `-u "opencode:$OPENCODE_SERVER_PASSWORD"` to each curl call.
-
-```bash
-BASE=http://127.0.0.1:4096
-
-SID=$(curl -sS -X POST "$BASE/session" \
-  -H 'content-type: application/json' \
-  -u "opencode:$OPENCODE_SERVER_PASSWORD" \
-  -d '{"title":"Bash orchestration run"}' | jq -r .id)
-
-curl -sS -X POST "$BASE/session/$SID/command" \
-  -H 'content-type: application/json' \
-  -u "opencode:$OPENCODE_SERVER_PASSWORD" \
-  -d '{"command":"orchestrate","arguments":"Audit error handling and add tests"}'
-```
+- **JS/TS:** Use the SDK client to call `session.create()` and `session.command()`. See [SDK](/docs/sdk).
+- **Python / Go / Rust / Bash:** Use the HTTP server API directly (`POST /session`, `POST /session/:id/command`). See [Server](/docs/server).
 
 ---
 
@@ -407,7 +317,7 @@ A common pattern is hybrid:
 1. Start deny-by-default for `permission.task`, then explicitly allow worker agents.
 2. Keep worker agents narrow (planner/implementer/reviewer) and prompts single-purpose.
 3. Put orchestration entrypoints in commands (`/orchestrate`, `/plan-only`) for repeatability.
-4. Set `steps` on orchestrators and workers for cost control. A simple 3-step pipeline (plan → build → review) might need 10-15 orchestrator steps; complex pipelines with dual review, arbitration, and fix loops may need 30+.
+4. Set `steps` on orchestrators and workers for cost control. Scale the orchestrator's `steps` to match your pipeline depth — each subagent dispatch consumes at least one step.
 5. Use child session visibility (`/session/:id/children` and UI navigation) as a first-line debugging signal.
 6. Keep manual `@mention` available for operator override.
 7. Have subagents include a self-identification header (model name, role, date) at the top of their output artifacts. This lets you verify that dispatch actually reached the intended subagent rather than the orchestrator role-playing the response. Especially valuable when debugging silent failures.
@@ -423,8 +333,7 @@ Before declaring your orchestration stable:
 3. Command-driven invocation works (`/orchestrate ...`).
 4. Child sessions are visible from parent session.
 5. Manual `@worker` invocation behaves as expected.
-6. A non-JS client (for example Python) can trigger the same command path.
-7. Subagent outputs contain self-identification (confirming the right model handled the right role).
+6. Subagent outputs contain self-identification (confirming the right model handled the right role).
 
 ---
 
