@@ -1,0 +1,437 @@
+---
+title: Orchestration
+description: Build multi-agent orchestration with OpenCode using config/markdown and server APIs.
+---
+
+Orchestration in OpenCode means coordinating a primary agent and one or more subagents to complete multi-step work reliably.
+
+This guide is for two audiences:
+
+1. Teams that want **config + markdown orchestration** (no custom runtime).
+2. Developers building orchestration drivers in **Python, Go, Rust, Bash, JS/TS** via the server API.
+
+---
+
+## Mental model
+
+OpenCode orchestration is **session-based**.
+
+- A primary agent handles the main conversation.
+- Subagents are invoked through the **Task tool**.
+- Subagent runs are tracked as **child sessions** of the parent session.
+- You can inspect parent/child relationships through session APIs and UI navigation.
+
+If you get this model right, orchestration becomes predictable. If you treat subagents like plain function calls with no session lifecycle, behavior will be inconsistent.
+
+**Context growth:** Each subagent's full response is returned into the orchestrator's context window. In multi-step workflows, orchestrator context grows with every dispatch. Keep subagent outputs concise and structured. If your orchestrator model has a smaller context window, this can become the limiting factor before `steps` is reached.
+
+See [Agents](/docs/agents), [Commands](/docs/commands), and [Server](/docs/server).
+
+---
+
+## Path A: Config + Markdown Orchestration
+
+This is the easiest way to orchestrate without writing your own runtime.
+
+### Model selection
+
+Each agent slot can use a different model via the `model` field. This is one of the strongest advantages of config-based orchestration — you can assign models based on role requirements:
+
+- **Orchestrator:** Needs strong instruction-following and gate compliance. Not all models reliably pause for human checkpoints or dispatch subagents correctly. Test orchestrator candidates with your actual workflow before trusting them.
+- **Planning/review roles:** Benefit from reasoning depth and structured output. Often a good fit for models that are fast and analytical.
+- **Implementation roles (builder/fixer):** Benefit from strong code generation. Models with coding-specific training tend to outperform general-purpose models here.
+- **High-judgment roles (arbiter/synthesis):** Benefit from the most capable model you can afford — these roles resolve conflicting inputs and make final calls.
+
+Using different model families across roles also produces genuine diversity of perspective — for example, two reviewers from different families will catch different issues rather than rubber-stamping each other.
+
+### 1) Define an orchestrator and workers
+
+Use markdown agent files in `.opencode/agents/`.
+
+```markdown title=".opencode/agents/orchestrator.md"
+---
+description: Coordinates planning, implementation, and review by delegating to subagents
+mode: primary
+steps: 12
+permission:
+  task:
+    "*": deny
+    planner: allow
+    implementer: allow
+    reviewer: allow
+---
+
+You are the orchestration agent.
+
+Workflow:
+1. Clarify the request and constraints.
+2. Call `task` with `subagent_type: planner` to produce a plan.
+3. Call `task` with `subagent_type: implementer` to execute the approved plan.
+4. Call `task` with `subagent_type: reviewer` to validate the result.
+5. Return a concise summary, open issues, and next actions.
+
+Do not skip delegation steps unless the user explicitly asks for a direct answer.
+```
+
+```markdown title=".opencode/agents/planner.md"
+---
+description: Produces implementation plans with clear validation steps
+mode: subagent
+permission:
+  edit: deny
+  bash: deny
+---
+
+Create a concrete implementation plan with:
+- files to change
+- ordered steps
+- validation commands
+- risks and rollback notes
+```
+
+```markdown title=".opencode/agents/implementer.md"
+---
+description: Implements approved plans
+mode: subagent
+permission:
+  edit: ask
+  bash:
+    "*": ask
+    "npm test*": allow
+    "pytest*": allow
+---
+
+Implement only what is in scope. Run relevant validation before returning.
+```
+
+```markdown title=".opencode/agents/reviewer.md"
+---
+description: Performs focused quality and risk review
+mode: subagent
+permission:
+  edit: deny
+  bash:
+    "*": deny
+---
+
+Review for correctness, regressions, and missing tests. Return findings by severity.
+```
+
+If you prefer JSON config for agent definitions, this is the equivalent minimal setup:
+
+```json title="opencode.json"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "orchestrator": {
+      "description": "Coordinates planner, implementer, and reviewer subagents",
+      "mode": "primary",
+      "steps": 12,
+      "prompt": "{file:.opencode/agents/orchestrator.md}",
+      "permission": {
+        "task": {
+          "*": "deny",
+          "planner": "allow",
+          "implementer": "allow",
+          "reviewer": "allow"
+        }
+      }
+    },
+    "planner": {
+      "description": "Planning worker",
+      "mode": "subagent",
+      "prompt": "{file:.opencode/agents/planner.md}"
+    },
+    "implementer": {
+      "description": "Implementation worker",
+      "mode": "subagent",
+      "prompt": "{file:.opencode/agents/implementer.md}"
+    },
+    "reviewer": {
+      "description": "Review worker",
+      "mode": "subagent",
+      "prompt": "{file:.opencode/agents/reviewer.md}"
+    }
+  },
+  "command": {
+    "orchestrate": {
+      "description": "Run orchestration workflow",
+      "agent": "orchestrator",
+      "template": "$ARGUMENTS"
+    }
+  }
+}
+```
+
+### 2) Define orchestration entry commands
+
+Use command markdown files in `.opencode/commands/`.
+
+```markdown title=".opencode/commands/orchestrate.md"
+---
+description: Run the orchestration workflow
+agent: orchestrator
+---
+
+$ARGUMENTS
+```
+
+You can also force isolated subtask execution with `subtask: true`:
+
+```markdown title=".opencode/commands/plan-only.md"
+---
+description: Run planner as an isolated subtask
+agent: planner
+subtask: true
+---
+
+$ARGUMENTS
+```
+
+### 3) Run it
+
+```txt frame="none"
+/orchestrate Add structured logging to the API and include tests.
+```
+
+---
+
+## Three invocation paths
+
+OpenCode supports three practical subagent invocation paths:
+
+1. **Model-driven Task tool call**
+- The primary agent decides to call `task`.
+- Best for autonomous workflows controlled by the agent prompt.
+
+2. **Command subtask path**
+- A command with a subagent target (or `subtask: true`) triggers subagent invocation.
+- Best for repeatable orchestration entrypoints.
+
+3. **Manual @mention**
+- Users can invoke subagents directly in the UI with `@agent-name`.
+- Useful for ad-hoc intervention and debugging.
+
+Important nuance: `permission.task` governs model Task-tool dispatch. Users can still manually invoke subagents via `@` mention.
+
+---
+
+## Advanced patterns: branching and loops
+
+Most real orchestration flows are not strictly linear. Two common patterns are:
+
+1. **Fan-out / fan-in (branching)**
+2. **Iteration loops (refine until acceptable)**
+
+### Fan-out / fan-in (for independent review tracks)
+
+Use multiple specialized subagents for independent perspectives, then merge with an arbiter/synthesizer agent.
+
+Example worker set:
+- `planner` (plan creation)
+- `reviewer-a` (first independent review)
+- `reviewer-b` (second independent review)
+- `arbiter` (merge/conflict resolution)
+
+In config/markdown orchestration, this is usually done by explicitly instructing the orchestrator to:
+1. call both reviewer agents on the same artifact/instructions
+2. collect both outputs
+3. call arbiter with both reviews
+
+In code-based orchestration, you can fan out by creating sibling child sessions (`parentID` = same parent session) and dispatching prompts to each child, then fan in by posting both outputs to an arbiter step.
+
+Important: true branch parallelism is most reliable when you run multiple child sessions from code. Within a single session turn, tool execution may still be effectively sequential depending on runtime behavior.
+If your runtime path does not execute branch calls concurrently in practice, this pattern is still valid as a sequential fan-out/fan-in flow.
+
+### Example setup for Iteration loops (for fix/refinement cycles)
+
+Use a status-gated loop with a hard limit.
+
+A practical pattern:
+1. reviewer returns `APPROVE` or `ITERATE` with concrete issues
+2. implementer addresses issues
+3. reviewer re-checks
+4. stop on `APPROVE` or `max_iterations`
+
+Example contract for deterministic routing:
+
+```json title="review-output.json"
+{
+  "decision": "APPROVE | ITERATE",
+  "issues": [
+    {
+      "severity": "high | medium | low",
+      "path": "relative/file/path",
+      "summary": "what is wrong",
+      "required_action": "what must change"
+    }
+  ],
+  "next_action": "review | implement | stop"
+}
+```
+
+Guardrails:
+- set explicit `max_iterations` in your orchestration logic
+- set `steps` on orchestrator and workers for cost control
+- make worker outputs structured enough for deterministic routing (for example a required `decision` field)
+
+---
+
+## Path B: Code-based orchestration via SDK/API
+
+Use this when you need custom control flow, external systems, or language-specific tooling.
+
+:::note
+The examples below are derived from OpenCode's source and API surface. Path A (config + markdown) has been extensively field-tested; Path B has not yet been validated end-to-end. If you encounter issues, please report them.
+:::
+
+### JS/TS SDK example
+
+```ts
+import { createOpencode } from "@opencode-ai/sdk"
+
+const { client } = await createOpencode()
+
+// Create a parent session
+const session = await client.session.create({
+  body: { title: "Orchestration run" },
+})
+
+// Trigger orchestration command (defined in .opencode/commands/orchestrate.md)
+const result = await client.session.command({
+  path: { id: session.id },
+  body: {
+    command: "orchestrate",
+    arguments: "Refactor auth middleware and add coverage",
+  },
+})
+
+console.log(result.data.info.id)
+```
+
+See [SDK](/docs/sdk).
+
+### Python HTTP example
+
+If your server is protected with `OPENCODE_SERVER_PASSWORD`, use HTTP basic auth (`opencode` as username by default).
+
+```python
+import requests
+
+BASE = "http://127.0.0.1:4096"
+AUTH = ("opencode", "your-server-password")  # optional
+
+# 1) Create parent session
+session = requests.post(
+    f"{BASE}/session",
+    json={"title": "Python orchestration run"},
+    auth=AUTH,  # remove if auth is disabled
+)
+session.raise_for_status()
+sid = session.json()["id"]
+
+# 2) Execute orchestration command
+resp = requests.post(
+    f"{BASE}/session/{sid}/command",
+    json={
+        "command": "orchestrate",
+        "arguments": "Add request IDs across API handlers and tests",
+    },
+    auth=AUTH,  # remove if auth is disabled
+)
+resp.raise_for_status()
+print(resp.json())
+```
+
+See [Server](/docs/server).
+
+### Bash HTTP example
+
+If your server is protected, add `-u "opencode:$OPENCODE_SERVER_PASSWORD"` to each curl call.
+
+```bash
+BASE=http://127.0.0.1:4096
+
+SID=$(curl -sS -X POST "$BASE/session" \
+  -H 'content-type: application/json' \
+  -u "opencode:$OPENCODE_SERVER_PASSWORD" \
+  -d '{"title":"Bash orchestration run"}' | jq -r .id)
+
+curl -sS -X POST "$BASE/session/$SID/command" \
+  -H 'content-type: application/json' \
+  -u "opencode:$OPENCODE_SERVER_PASSWORD" \
+  -d '{"command":"orchestrate","arguments":"Audit error handling and add tests"}'
+```
+
+---
+
+## Config/Markdown vs Code: when to choose
+
+Use **config + markdown** when:
+- workflow is mostly prompt-driven
+- team wants low operational overhead
+- orchestration should live with repo config
+
+Use **code-based orchestration** when:
+- you need external state machines or schedulers
+- you need cross-service calls and custom retries/timeouts
+- you need non-UI triggers (CI, bots, backend jobs)
+
+A common pattern is hybrid:
+- orchestration behavior in agents/commands
+- external driver for trigger + observability + policy
+
+---
+
+## Common pitfalls
+
+1. Missing `permission.task`
+- Orchestrator cannot reliably dispatch workers.
+
+2. Rule ordering mistakes
+- Permission rules are order-sensitive; last match wins.
+
+3. Weak orchestrator prompt
+- If dispatch expectations are vague, delegation becomes inconsistent.
+
+4. Assuming timeouts from `steps`
+- `steps` limits agentic iterations, not wall-clock runtime.
+
+5. Treating orchestration as stateless
+- Subagent runs are session lifecycle events, not plain text callbacks.
+
+---
+
+## Best practices
+
+1. Start deny-by-default for `permission.task`, then explicitly allow worker agents.
+2. Keep worker agents narrow (planner/implementer/reviewer) and prompts single-purpose.
+3. Put orchestration entrypoints in commands (`/orchestrate`, `/plan-only`) for repeatability.
+4. Set `steps` on orchestrators and workers for cost control. A simple 3-step pipeline (plan → build → review) might need 10-15 orchestrator steps; complex pipelines with dual review, arbitration, and fix loops may need 30+.
+5. Use child session visibility (`/session/:id/children` and UI navigation) as a first-line debugging signal.
+6. Keep manual `@mention` available for operator override.
+7. Have subagents include a self-identification header (model name, role, date) at the top of their output artifacts. This lets you verify that dispatch actually reached the intended subagent rather than the orchestrator role-playing the response. Especially valuable when debugging silent failures.
+
+---
+
+## Verification checklist
+
+Before declaring your orchestration stable:
+
+1. `orchestrator` can invoke each intended worker.
+2. Denied workers are actually blocked from Task-tool dispatch.
+3. Command-driven invocation works (`/orchestrate ...`).
+4. Child sessions are visible from parent session.
+5. Manual `@worker` invocation behaves as expected.
+6. A non-JS client (for example Python) can trigger the same command path.
+7. Subagent outputs contain self-identification (confirming the right model handled the right role).
+
+---
+
+## Related docs
+
+- [Agents](/docs/agents)
+- [Commands](/docs/commands)
+- [Permissions](/docs/permissions)
+- [Server](/docs/server)
+- [SDK](/docs/sdk)

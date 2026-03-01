@@ -38,6 +38,8 @@ Subagents are specialized assistants that primary agents can invoke for specific
 
 OpenCode comes with two built-in subagents, **General** and **Explore**. We'll look at this below.
 
+If you want to coordinate multiple subagents as a workflow, see [Orchestration](/docs/orchestration).
+
 ---
 
 ## Built-in
@@ -566,6 +568,8 @@ Only applies to `mode: subagent` agents.
 ### Task permissions
 
 Control which subagents an agent can invoke via the Task tool with `permission.task`. Uses glob patterns for flexible matching.
+
+For practical multi-agent workflow patterns (fan-out/fan-in and iteration loops), see [Orchestration](/docs/orchestration).
 
 ```json title="opencode.json"
 {
